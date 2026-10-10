@@ -6,12 +6,18 @@
   "scripts": {
     "dev": "node --watch --env-file-if-exists=../.env app.js",
     "start": "node --env-file-if-exists=../.env app.js",
-    "test": "node --test ./tests/*.test.js"
+    "test": "node --test ./tests/*.test.js",
+    "migrate:sqlite": "node ./scripts/migrate-sqlite-to-postgres.js",
+    "admin:password": "node --env-file-if-exists=../.env ./scripts/set-admin-password.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^12.2.0",
+    "cors": "^2.8.6",
     "express": "^5.1.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "better-sqlite3": "^12.11.1"
   }
 }

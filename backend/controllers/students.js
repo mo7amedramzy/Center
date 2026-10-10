@@ -1,4 +1,4 @@
-import { db } from '../config/database.js';
+import { withTransaction } from '../config/database.js';
 
 const MAX_IMPORT_STUDENTS = 500;
 
@@ -26,65 +26,80 @@ function getRowErrors(student, source) {
     }
   }
   if (!student.name) errors.push('اسم الطالب مطلوب');
-  if (student.name.length > 120) errors.push('اسم الطالب أطول من الحد المسموح (120 حرفًا)');
-  if (student.phone.length > 40) errors.push('رقم هاتف الطالب أطول من الحد المسموح (40 حرفًا)');
-  if (student.guardianPhone.length > 40) errors.push('رقم هاتف ولي الأمر أطول من الحد المسموح (40 حرفًا)');
-  if (student.grade.length > 80) errors.push('الصف الدراسي أطول من الحد المسموح (80 حرفًا)');
-  if (student.notes.length > 1000) errors.push('الملاحظات أطول من الحد المسموح (1000 حرف)');
+  if (student.name.length > 120)
+    errors.push('اسم الطالب أطول من الحد المسموح (120 حرفًا)');
+  if (student.phone.length > 40)
+    errors.push('رقم هاتف الطالب أطول من الحد المسموح (40 حرفًا)');
+  if (student.guardianPhone.length > 40)
+    errors.push('رقم هاتف ولي الأمر أطول من الحد المسموح (40 حرفًا)');
+  if (student.grade.length > 80)
+    errors.push('الصف الدراسي أطول من الحد المسموح (80 حرفًا)');
+  if (student.notes.length > 1000)
+    errors.push('الملاحظات أطول من الحد المسموح (1000 حرف)');
   return errors;
 }
 
-export function importStudents(request, response) {
+export async function importStudents(request, response) {
   const { groupId, students } = request.body || {};
   const numericGroupId = Number(groupId);
   if (!Number.isSafeInteger(numericGroupId) || numericGroupId < 1) {
-    return response.status(400).json({ error: 'اختر مجموعة صحيحة لإضافة الطلاب إليها.' });
+    return response
+      .status(400)
+      .json({ error: 'اختر مجموعة صحيحة لإضافة الطلاب إليها.' });
   }
-  if (!Array.isArray(students) || students.length < 1 || students.length > MAX_IMPORT_STUDENTS) {
-    return response.status(400).json({ error: 'يجب إرسال من طالب واحد إلى 500 طالب في الدفعة الواحدة.' });
+  if (
+    !Array.isArray(students) ||
+    students.length < 1 ||
+    students.length > MAX_IMPORT_STUDENTS
+  ) {
+    return response.status(400).json({
+      error: 'يجب إرسال من طالب واحد إلى 500 طالب في الدفعة الواحدة.',
+    });
   }
 
   const normalizedRows = students.map((input, index) => {
-    const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+    const source =
+      input && typeof input === 'object' && !Array.isArray(input) ? input : {};
     const fields = {};
     for (const field of ['name', 'phone', 'guardianPhone', 'grade', 'notes']) {
       fields[field] = typeof source[field] === 'string' ? source[field].trim() : '';
     }
     const suppliedRowNumber = Number(source.rowNumber);
-    const rowNumber = Number.isSafeInteger(suppliedRowNumber) && suppliedRowNumber > 0
-      ? suppliedRowNumber
-      : index + 2;
+    const rowNumber =
+      Number.isSafeInteger(suppliedRowNumber) && suppliedRowNumber > 0
+        ? suppliedRowNumber
+        : index + 2;
     return { ...fields, rowNumber, errors: getRowErrors(fields, source) };
   });
 
+  let result;
   try {
-    const result = db.transaction(() => {
-      const group = db
-        .prepare('SELECT id FROM groups WHERE id = ? AND active = 1')
-        .get(numericGroupId);
-      if (!group) {
+    result = await withTransaction(async (client) => {
+      const group = await client.query(
+        'SELECT id FROM groups WHERE id = $1 AND active = TRUE',
+        [numericGroupId],
+      );
+      if (!group.rowCount) {
         return { groupMissing: true, added: 0, errors: [] };
       }
 
       const existingContacts = new Map();
-      const activeStudents = db
-        .prepare('SELECT name, phone, guardian_phone AS guardianPhone FROM students WHERE active = 1')
-        .all();
-      for (const existing of activeStudents) {
+      const activeStudents = await client.query(
+        `SELECT name, phone, guardian_phone AS "guardianPhone"
+         FROM students WHERE active = TRUE`,
+      );
+      for (const existing of activeStudents.rows) {
         const name = normalizeName(existing.name);
-        const contacts = [normalizeContact(existing.phone), normalizeContact(existing.guardianPhone)]
-          .filter(Boolean);
+        const contacts = [
+          normalizeContact(existing.phone),
+          normalizeContact(existing.guardianPhone),
+        ].filter(Boolean);
         if (!name || !contacts.length) continue;
         const knownContacts = existingContacts.get(name) || new Set();
         contacts.forEach((contact) => knownContacts.add(contact));
         existingContacts.set(name, knownContacts);
       }
-      const insertStudent = db.prepare(
-        'INSERT INTO students (name, phone, grade, guardian_phone, notes) VALUES (?, ?, ?, ?, ?)',
-      );
-      const insertEnrollment = db.prepare(
-        'INSERT INTO enrollments (student_id, group_id) VALUES (?, ?)',
-      );
+
       const importedContacts = new Map();
       const errors = [];
       let added = 0;
@@ -101,8 +116,10 @@ export function importStudents(request, response) {
         }
 
         const normalizedStudentName = normalizeName(student.name);
-        const contacts = [normalizeContact(student.phone), normalizeContact(student.guardianPhone)]
-          .filter(Boolean);
+        const contacts = [
+          normalizeContact(student.phone),
+          normalizeContact(student.guardianPhone),
+        ].filter(Boolean);
         const duplicateInDatabase = contacts.some((contact) =>
           existingContacts.get(normalizedStudentName)?.has(contact),
         );
@@ -113,22 +130,28 @@ export function importStudents(request, response) {
         if (duplicateInDatabase || duplicateInBatch) {
           errors.push({
             rowNumber: student.rowNumber,
-            error: 'الطالب موجود بالفعل (الاسم ورقم الهاتف متطابقان)، ولم يتم تعديل بياناته.',
+            error:
+              'الطالب موجود بالفعل (الاسم ورقم الهاتف متطابقان)، ولم يتم تعديل بياناته.',
           });
           skipped += 1;
           continue;
         }
 
-        const id = Number(
-          insertStudent.run(
+        const inserted = await client.query(
+          `INSERT INTO students (name, phone, grade, guardian_phone, notes)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+          [
             student.name,
             student.phone,
             student.grade,
             student.guardianPhone,
             student.notes,
-          ).lastInsertRowid,
+          ],
         );
-        insertEnrollment.run(id, numericGroupId);
+        await client.query(
+          'INSERT INTO enrollments (student_id, group_id) VALUES ($1, $2)',
+          [inserted.rows[0].id, numericGroupId],
+        );
         added += 1;
 
         if (contacts.length) {
@@ -136,24 +159,29 @@ export function importStudents(request, response) {
             existingContacts.get(normalizedStudentName) || new Set();
           contacts.forEach((contact) => knownExistingContacts.add(contact));
           existingContacts.set(normalizedStudentName, knownExistingContacts);
-          const knownContacts = importedContacts.get(normalizedStudentName) || new Set();
+          const knownContacts =
+            importedContacts.get(normalizedStudentName) || new Set();
           contacts.forEach((contact) => knownContacts.add(contact));
           importedContacts.set(normalizedStudentName, knownContacts);
         }
       }
       return { groupMissing: false, added, skipped, errors };
-    })();
-
-    if (result.groupMissing) {
-      return response.status(400).json({ error: 'المجموعة غير موجودة أو غير نشطة.' });
-    }
-    response.json({
-      added: result.added,
-      skipped: result.skipped,
-      errors: result.errors,
     });
   } catch (error) {
     console.error('Student import failed; transaction rolled back.', error);
-    response.status(500).json({ error: 'تعذر استيراد الطلاب. لم تُحفظ أي بيانات من هذه الدفعة.' });
+    return response.status(500).json({
+      error: 'تعذر استيراد الطلاب. لم تُحفظ أي بيانات من هذه الدفعة.',
+    });
   }
+
+  if (result.groupMissing) {
+    return response
+      .status(400)
+      .json({ error: 'المجموعة غير موجودة أو غير نشطة.' });
+  }
+  response.json({
+    added: result.added,
+    skipped: result.skipped,
+    errors: result.errors,
+  });
 }

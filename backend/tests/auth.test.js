@@ -1,146 +1,259 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 
-const currentDir = path.dirname(fileURLToPath(import.meta.url));
-const dbPath = path.join(currentDir, '.tmp', 'center.sqlite');
-process.env.JWT_SECRET = 'test-jwt-secret';
-process.env.ADMIN_USERNAME = 'admin';
-process.env.ADMIN_PASSWORD = 'markaz123';
-process.env.NODE_ENV = 'test';
-process.env.DB_PATH = './backend/tests/.tmp/center.sqlite';
+const testDatabaseUrl = process.env.TEST_DATABASE_URL;
+const runId = `${process.pid}_${Date.now()}`;
+const adminUsername = `integration_admin_${runId}`;
+const adminPassword = `integration_password_${runId}`;
 
-fs.rmSync(dbPath, { force: true });
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+if (testDatabaseUrl) {
+  process.env.DATABASE_URL = testDatabaseUrl;
+  process.env.NODE_ENV = 'test';
+  process.env.JWT_SECRET = `integration_jwt_${runId}`;
+  process.env.ADMIN_USERNAME = adminUsername;
+  process.env.ADMIN_PASSWORD = adminPassword;
+}
 
-const { default: app } = await import('../app.js');
-const { db } = await import('../config/database.js');
+describe('PostgreSQL API integration', () => {
+  if (!testDatabaseUrl) {
+    test(
+      'requires a disposable PostgreSQL database',
+      { skip: 'Set TEST_DATABASE_URL to a disposable PostgreSQL database' },
+      () => {},
+    );
+  } else {
+    let app;
+    let pool;
+    let initializeDatabase;
+    let closeDatabase;
+    let server;
+    let baseUrl;
+    let teacherId;
+    let groupId;
+    let studentId;
 
-let server;
-let port;
-
-before(async () => {
-  server = app.listen(0, '127.0.0.1');
-  await new Promise((resolve) => server.once('listening', resolve));
-  port = server.address().port;
-});
-
-after(async () => {
-  await new Promise((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  });
-  db.close();
-  fs.rmSync(dbPath, { force: true });
-});
-
-describe('backend auth and health', () => {
-  test('health endpoint reports app and database status', async () => {
-    const response = await fetch(`http://127.0.0.1:${port}/api/health`);
-    const payload = await response.json();
-    assert.equal(response.status, 200);
-    assert.equal(payload.ok, true);
-    assert.equal(payload.database, 'ok');
-  });
-
-  test('admin login succeeds and invalid login fails', async () => {
-    const success = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: 'markaz123' }),
+    before(async () => {
+      ({ default: app } = await import('../app.js'));
+      ({ pool, initializeDatabase, closeDatabase } = await import(
+        '../config/database.js'
+      ));
+      await initializeDatabase();
+      server = app.listen(0, '127.0.0.1');
+      await new Promise((resolve, reject) => {
+        server.once('listening', resolve);
+        server.once('error', reject);
+      });
+      baseUrl = `http://127.0.0.1:${server.address().port}`;
     });
-    const successPayload = await success.json();
-    assert.equal(success.status, 200);
-    assert.equal(successPayload.user.role, 'admin');
-    assert.ok(successPayload.token);
 
-    const failure = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: 'wrong-password' }),
+    after(async () => {
+      if (server?.listening) {
+        await new Promise((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        });
+      }
+      if (pool) {
+        if (teacherId) {
+          await pool.query(
+            `DELETE FROM attendance
+             WHERE session_id IN (SELECT id FROM sessions WHERE group_id IN
+               (SELECT id FROM groups WHERE teacher_id = $1))`,
+            [teacherId],
+          );
+          await pool.query(
+            'DELETE FROM sessions WHERE group_id IN (SELECT id FROM groups WHERE teacher_id = $1)',
+            [teacherId],
+          );
+          await pool.query(
+            'DELETE FROM enrollments WHERE group_id IN (SELECT id FROM groups WHERE teacher_id = $1)',
+            [teacherId],
+          );
+          if (studentId) {
+            await pool.query('DELETE FROM attendance WHERE student_id = $1', [
+              studentId,
+            ]);
+            await pool.query('DELETE FROM enrollments WHERE student_id = $1', [
+              studentId,
+            ]);
+            await pool.query('DELETE FROM students WHERE id = $1', [studentId]);
+          }
+          await pool.query('DELETE FROM groups WHERE teacher_id = $1', [
+            teacherId,
+          ]);
+          await pool.query('DELETE FROM users WHERE teacher_id = $1', [
+            teacherId,
+          ]);
+          await pool.query('DELETE FROM teachers WHERE id = $1', [teacherId]);
+        }
+        await pool.query('DELETE FROM users WHERE username = $1', [
+          adminUsername,
+        ]);
+      }
+      if (closeDatabase) await closeDatabase();
     });
-    assert.equal(failure.status, 401);
-  });
 
-  test('teacher login succeeds and access checks respect teacher group ownership', async () => {
-    const teacherLogin = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'ahmed', password: 'teacher123' }),
-    });
-    const teacherPayload = await teacherLogin.json();
-    assert.equal(teacherLogin.status, 200);
-    assert.equal(teacherPayload.user.role, 'teacher');
+    test('initializes schema and admin, authenticates users, and preserves API operations', async () => {
+      const healthResponse = await fetch(`${baseUrl}/api/health`);
+      const health = await healthResponse.json();
+      assert.equal(healthResponse.status, 200);
+      assert.equal(health.ok, true);
+      assert.equal(health.database, 'ok');
 
-    const meResponse = await fetch(`http://127.0.0.1:${port}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${teacherPayload.token}` },
-    });
-    const mePayload = await meResponse.json();
-    assert.equal(meResponse.status, 200);
-    assert.equal(mePayload.role, 'teacher');
+      await initializeDatabase();
+      const adminLogin = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: adminUsername,
+          password: adminPassword,
+        }),
+      });
+      const adminPayload = await adminLogin.json();
+      assert.equal(adminLogin.status, 200);
+      assert.equal(adminPayload.user.role, 'admin');
+      assert.ok(adminPayload.token);
 
-    const groupsResponse = await fetch(`http://127.0.0.1:${port}/api/groups`, {
-      headers: { Authorization: `Bearer ${teacherPayload.token}` },
-    });
-    const groups = await groupsResponse.json();
-    assert.equal(groupsResponse.status, 200);
-    assert.ok(groups.length > 0);
-    const group = groups[0];
-    assert.equal(group.teacherId, mePayload.teacherId);
+      const adminHeaders = {
+        Authorization: `Bearer ${adminPayload.token}`,
+        'Content-Type': 'application/json',
+      };
+      const teacherResponse = await fetch(`${baseUrl}/api/teachers`, {
+        method: 'POST',
+        headers: adminHeaders,
+        body: JSON.stringify({
+          name: `Integration teacher ${runId}`,
+          phone: '01000000000',
+          subject: 'Physics',
+        }),
+      });
+      assert.equal(teacherResponse.status, 201);
+      teacherId = (await teacherResponse.json()).id;
 
-    const unauthorizedGroup = await fetch(`http://127.0.0.1:${port}/api/groups/${groups[0].id + 999}`, {
-      headers: { Authorization: `Bearer ${teacherPayload.token}` },
-    });
-    assert.equal(unauthorizedGroup.status, 404);
-  });
+      const groupsResponse = await fetch(`${baseUrl}/api/groups`, {
+        headers: adminHeaders,
+      });
+      assert.equal(groupsResponse.status, 200);
+      const groups = await groupsResponse.json();
+      groupId = groups.find((group) => group.teacherId === teacherId)?.id;
+      assert.ok(groupId);
 
-  test('bulk group creation accepts the required fields and creates multiple groups', async () => {
-    const adminLogin = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: 'markaz123' }),
-    });
-    const adminPayload = await adminLogin.json();
-    assert.equal(adminLogin.status, 200);
+      const teacherLogin = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: `teacher_${teacherId}`,
+          password: 'teacher123',
+        }),
+      });
+      const teacherPayload = await teacherLogin.json();
+      assert.equal(teacherLogin.status, 200);
+      assert.equal(teacherPayload.user.role, 'teacher');
 
-    const teachersResponse = await fetch(`http://127.0.0.1:${port}/api/teachers`, {
-      headers: { Authorization: `Bearer ${adminPayload.token}` },
-    });
-    const teachers = await teachersResponse.json();
-    assert.equal(teachersResponse.status, 200);
-    assert.ok(teachers.length > 0);
+      const teacherGroupsResponse = await fetch(`${baseUrl}/api/groups`, {
+        headers: { Authorization: `Bearer ${teacherPayload.token}` },
+      });
+      const teacherGroups = await teacherGroupsResponse.json();
+      assert.equal(teacherGroupsResponse.status, 200);
+      assert.ok(teacherGroups.every((group) => group.teacherId === teacherId));
 
-    const singleGroup = await fetch(`http://127.0.0.1:${port}/api/groups`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminPayload.token}` },
-      body: JSON.stringify({
-        teacherId: teachers[0].id,
-        name: 'مجموعة اختبار واحدة',
-        subject: 'لغة عربية',
-        grade: 'الثالث الثانوي',
-        gradeLevel: 'third',
-        schedule: '09:00',
-      }),
-    });
-    const singleGroupPayload = await singleGroup.json();
-    assert.equal(singleGroup.status, 201);
-    assert.ok(singleGroupPayload.id);
+      const studentResponse = await fetch(`${baseUrl}/api/students`, {
+        method: 'POST',
+        headers: adminHeaders,
+        body: JSON.stringify({
+          name: `Integration student ${runId}`,
+          phone: '01000000001',
+          groupId,
+        }),
+      });
+      assert.equal(studentResponse.status, 201);
+      studentId = (await studentResponse.json()).id;
 
-    const bulkResponse = await fetch(`http://127.0.0.1:${port}/api/groups/bulk`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminPayload.token}` },
-      body: JSON.stringify({
-        teacherId: teachers[0].id,
-        subject: 'علوم',
-        grade: 'الثالث الثانوي',
-        gradeLevel: 'third',
-        schedule: '10:00',
-        names: ['مجموعة علوم 1', 'مجموعة علوم 2'],
-      }),
+      const duplicateEnrollment = await fetch(
+        `${baseUrl}/api/students/${studentId}/enrollments`,
+        {
+          method: 'POST',
+          headers: adminHeaders,
+          body: JSON.stringify({ groupId }),
+        },
+      );
+      assert.equal(duplicateEnrollment.status, 409);
+
+      const attendanceResponse = await fetch(
+        `${baseUrl}/api/groups/${groupId}/attendance`,
+        {
+          method: 'PUT',
+          headers: adminHeaders,
+          body: JSON.stringify({
+            date: '2026-10-10',
+            entries: [{ studentId, status: 'present' }],
+          }),
+        },
+      );
+      const attendancePayload = await attendanceResponse.json();
+      assert.equal(attendanceResponse.status, 200);
+      assert.ok(attendancePayload.sessionId);
+
+      const attendanceListResponse = await fetch(
+        `${baseUrl}/api/groups/${groupId}/attendance?date=2026-10-10`,
+        { headers: adminHeaders },
+      );
+      const attendanceList = await attendanceListResponse.json();
+      assert.equal(attendanceListResponse.status, 200);
+      assert.equal(attendanceList.students[0].status, 'present');
+
+      const studentDetailResponse = await fetch(
+        `${baseUrl}/api/students/${studentId}`,
+        { headers: adminHeaders },
+      );
+      const studentDetail = await studentDetailResponse.json();
+      assert.equal(studentDetailResponse.status, 200);
+      assert.equal(studentDetail.attendanceRate, 100);
     });
-    const bulkPayload = await bulkResponse.json();
-    assert.equal(bulkResponse.status, 201);
-    assert.equal(bulkPayload.ids.length, 2);
-  });
+
+    test('rolls back a failed multi-statement PostgreSQL transaction', async () => {
+      const { withTransaction } = await import('../config/database.js');
+      const marker = `rollback_${runId}`;
+      await assert.rejects(
+        withTransaction(async (client) => {
+          await client.query(
+            'INSERT INTO teachers (name, phone) VALUES ($1, $2)',
+            [marker, ''],
+          );
+          await client.query(
+            `INSERT INTO groups (teacher_id, name, subject, grade)
+             VALUES (2147483000, $1, 'test', 'test')`,
+            [marker],
+          );
+        }),
+      );
+      const result = await pool.query(
+        'SELECT COUNT(*)::int AS count FROM teachers WHERE name = $1',
+        [marker],
+      );
+      assert.equal(result.rows[0].count, 0);
+    });
+
+    test('rejects invalid credentials and protects admin-only routes', async () => {
+      const invalidLogin = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: adminUsername, password: 'incorrect' }),
+      });
+      assert.equal(invalidLogin.status, 401);
+
+      const teacherLogin = await fetch(`${baseUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: `teacher_${teacherId}`,
+          password: 'teacher123',
+        }),
+      });
+      const teacher = await teacherLogin.json();
+      const forbidden = await fetch(`${baseUrl}/api/teachers`, {
+        headers: { Authorization: `Bearer ${teacher.token}` },
+      });
+      assert.equal(forbidden.status, 403);
+    });
+  }
 });

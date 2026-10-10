@@ -1,0 +1,1 @@
+JWT_SECRET: b7d8dbc0671e35d9ebce560d3e5330c1  

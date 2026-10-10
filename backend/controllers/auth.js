@@ -3,9 +3,9 @@ import jwt from 'jsonwebtoken';
 import { jwtSecret } from '../middleware/auth.js';
 import { findActiveUserByUsername, findUserById } from '../models/users.js';
 
-export function login(request, response) {
+export async function login(request, response) {
   const { username, password } = request.body || {};
-  const user = findActiveUserByUsername(String(username || '').trim());
+  const user = await findActiveUserByUsername(String(username || '').trim());
   if (
     !user ||
     !bcrypt.compareSync(String(password || ''), user.password_hash)
@@ -27,8 +27,8 @@ export function login(request, response) {
   });
 }
 
-export function getCurrentUser(request, response) {
-  const user = findUserById(request.user.id);
+export async function getCurrentUser(request, response) {
+  const user = await findUserById(request.user.id);
   if (!user) {
     return response.status(401).json({ error: 'المستخدم غير موجود' });
   }
